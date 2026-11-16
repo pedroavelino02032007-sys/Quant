@@ -6,7 +6,9 @@ import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint
 import yfinance as yf
 
-# DATA
+# ==========================================
+# 1. DATA LOADING & TRAIN/TEST SPLIT
+# ==========================================
 stocks = ["AMD", "INTC"]
 years = 5
 end = dt.datetime.now()
@@ -19,31 +21,46 @@ if isinstance(close, pd.DataFrame):
 else:
   close = close.to_frame().dropna()
 
-# Train
 train_size = int(len(close) * 0.625)
 train_df = close.iloc[:train_size]
 test_df = close.iloc[train_size:].copy()
 
-# OLS HEDGE RATIO
+# ==========================================
+# 2. COINTEGRATION & OLS HEDGE RATIO
+# ==========================================
 score, p_value, crit_value = coint(train_df["AMD"], train_df["INTC"])
-print(f"P-Value: {p_value:.4f}")
+print(f"\n--- Cointegration Test ---")
+print(f"Cointegration P-Value: {p_value:.4f}")
+if p_value < 0.05:
+  print("Status: Pair is cointegrated! Safe to trade.")
+else:
+  print("Status: Warning: Pair is NOT cointegrated.")
 
 X = sm.add_constant(train_df["INTC"])
 model = sm.OLS(train_df["AMD"], X).fit()
 alpha = model.params["const"]
 beta = model.params["INTC"]
+print(f"\n--- OLS Regression ---")
 print(f"Hedge Ratio (Beta): {beta:.4f}, Alpha: {alpha:.4f}")
 
-# SPREAD PARAMETERS FOR MONTE CARLO
+# ==========================================
+# 3. EXTRACT TRAIN SPREAD PARAMETERS
+# ==========================================
 train_spread = train_df["AMD"] - (beta * train_df["INTC"])
 spread_mean = train_spread.mean()
 spread_std = train_spread.std()
 
-# MONTE CARLO
-num_simulations = 10
+# ==========================================
+# 4. MONTE CARLO SIMULATIONS (30 Paths)
+# ==========================================
+num_simulations = 30
 sim_steps = len(test_df)
 starting_capital = 10000.0
 
+print(
+    f"\nRunning {num_simulations} stochastic Monte Carlo simulations over"
+    f" {sim_steps} trading days..."
+)
 simulation_results = np.zeros((sim_steps, num_simulations))
 
 for sim in range(num_simulations):
@@ -60,7 +77,9 @@ for sim in range(num_simulations):
 
   simulation_results[:, sim] = sim_spread
 
-# BACKTESTING
+# ==========================================
+# 5. BACKTEST STRATEGY & PRE-TRADE KELLY SIZING
+# ==========================================
 window = 30
 max_holding_days = 20
 performance_logs = []
@@ -78,6 +97,7 @@ for sim in range(num_simulations):
   wins = 0
   portfolio_value = starting_capital
   days_in_trade = 0
+  trade_returns = []
   trade_records = []
 
   entry_idx = None
@@ -108,23 +128,50 @@ for sim in range(num_simulations):
         exit_idx = i
         exit_z = z
         trade_pnl = exit_z - entry_z
-        pnl_pct = (trade_pnl / abs(entry_z)) * 100 if entry_z != 0 else 0.0
+        pnl_pct = (trade_pnl / abs(entry_z)) if entry_z != 0 else 0.0
 
         risk = abs(entry_z - (-3.5))
         reward = abs(exit_z - entry_z)
         rr_ratio = reward / risk if risk > 0 else 0.0
 
-        portfolio_value += trade_pnl * 100
+        # --- Pre-Trade Kelly Criterion Estimation ---
+        # Using historical win rate & payout ratio prior to this trade, 
+        # or defaults (50% win rate, 1.0 payoff ratio) if no prior trades yet.
+        if trades > 0 and len(trade_returns) > 0:
+          current_wins = sum(1 for r in trade_returns if r > 0)
+          est_win_rate = current_wins / trades
+          wins_list = [r for r in trade_returns if r > 0]
+          losses_list = [abs(r) for r in trade_returns if r < 0]
+          avg_win = np.mean(wins_list) if len(wins_list) > 0 else 0.0
+          avg_loss = np.mean(losses_list) if len(losses_list) > 0 else 0.0001
+          b_ratio = (avg_win / avg_loss) if avg_loss > 0 else 1.0
+          kelly_f = max(
+              0.0,
+              min(
+                  ((est_win_rate * (b_ratio + 1) - 1) / b_ratio)
+                  if b_ratio > 0
+                  else 0.1,
+                  1.0,
+              ),
+          )
+        else:
+          kelly_f = 0.15  # Default conservative initial allocation before first trade
+
+        # Use Half-Kelly fractional sizing to position-size the dollar risk
+        position_capital = portfolio_value * (kelly_f * 0.5)
+        portfolio_value += trade_pnl * (position_capital / 100.0)
+
         trades += 1
         if trade_pnl > 0:
           wins += 1
+        trade_returns.append(pnl_pct)
 
         if sim == 0:
           trade_records.append({
               "start": entry_idx,
               "end": exit_idx,
               "entry_z": entry_z,
-              "pnl_pct": pnl_pct,
+              "pnl_pct": pnl_pct * 100,
               "rr": rr_ratio,
               "win": trade_pnl > 0,
           })
@@ -137,23 +184,46 @@ for sim in range(num_simulations):
         exit_idx = i
         exit_z = z
         trade_pnl = entry_z - exit_z
-        pnl_pct = (trade_pnl / abs(entry_z)) * 100 if entry_z != 0 else 0.0
+        pnl_pct = (trade_pnl / abs(entry_z)) if entry_z != 0 else 0.0
 
         risk = abs(entry_z - 3.5)
         reward = abs(entry_z - exit_z)
         rr_ratio = reward / risk if risk > 0 else 0.0
 
-        portfolio_value += trade_pnl * 100
+        if trades > 0 and len(trade_returns) > 0:
+          current_wins = sum(1 for r in trade_returns if r > 0)
+          est_win_rate = current_wins / trades
+          wins_list = [r for r in trade_returns if r > 0]
+          losses_list = [abs(r) for r in trade_returns if r < 0]
+          avg_win = np.mean(wins_list) if len(wins_list) > 0 else 0.0
+          avg_loss = np.mean(losses_list) if len(losses_list) > 0 else 0.0001
+          b_ratio = (avg_win / avg_loss) if avg_loss > 0 else 1.0
+          kelly_f = max(
+              0.0,
+              min(
+                  ((est_win_rate * (b_ratio + 1) - 1) / b_ratio)
+                  if b_ratio > 0
+                  else 0.1,
+                  1.0,
+              ),
+          )
+        else:
+          kelly_f = 0.15
+
+        position_capital = portfolio_value * (kelly_f * 0.5)
+        portfolio_value += trade_pnl * (position_capital / 100.0)
+
         trades += 1
         if trade_pnl > 0:
           wins += 1
+        trade_returns.append(pnl_pct)
 
         if sim == 0:
           trade_records.append({
               "start": entry_idx,
               "end": exit_idx,
               "entry_z": entry_z,
-              "pnl_pct": pnl_pct,
+              "pnl_pct": pnl_pct * 100,
               "rr": rr_ratio,
               "win": trade_pnl > 0,
           })
@@ -161,13 +231,13 @@ for sim in range(num_simulations):
         position = 0
         days_in_trade = 0
 
-
   total_gain_pct = (portfolio_value / starting_capital) - 1.0
+  win_rate = (wins / trades) if trades > 0 else 0.0
 
   performance_logs.append({
       "Simulation": sim + 1,
       "Total_Trades": trades,
-      "Wins": wins,
+      "Win_Rate_%": win_rate * 100,
       "Final_Portfolio_Value": portfolio_value,
       "Total_Gain_%": total_gain_pct,
   })
@@ -177,26 +247,34 @@ for sim in range(num_simulations):
     sample_z_series = z_score
 
 perf_df = pd.DataFrame(performance_logs)
-print("\n--- Monte Carlo Backtest Summary (First 10 Simulations) ---")
+
+# ==========================================
+# 6. TERMINAL SUMMARY DISPLAY
+# ==========================================
 display_df = perf_df.head(10).copy()
+display_df["Win_Rate_%"] = display_df["Win_Rate_%"].apply(lambda x: f"{x:.1f}%")
 display_df["Final_Portfolio_Value"] = display_df["Final_Portfolio_Value"].apply(
     lambda x: f"${x:,.2f}"
 )
 display_df["Total_Gain_%"] = display_df["Total_Gain_%"].apply(
     lambda x: f"{x * 100:.2f}%"
 )
+
+print(
+    "\n--- Monte Carlo Backtest Summary with Pre-Trade Kelly Sizing (First 10"
+    " Simulations) ---"
+)
 print(display_df.to_string(index=False))
 
 print(
-    f"\nAverage Final Portfolio Value Across 10 Simulations: "
+    f"\nAverage Final Portfolio Value: "
     f"${perf_df['Final_Portfolio_Value'].mean():,.2f}"
 )
-print(
-    f"Average Total Gain (%): "
-    f"{perf_df['Total_Gain_%'].mean() * 100:.2f}%"
-)
+print(f"Average Total Gain: {perf_df['Total_Gain_%'].mean() * 100:.2f}%")
 
-# MATPLOTLIB
+# ==========================================
+# 7. MATPLOTLIB VISUALIZATION (Simulation #1)
+# ==========================================
 fig, ax = plt.subplots(figsize=(14, 7), facecolor="#0b0f19")
 ax.set_facecolor("#0b0f19")
 
@@ -252,11 +330,11 @@ for tr in sample_trade_records:
   )
 
 sim1_trades = perf_df.loc[0, "Total_Trades"]
-sim1_wins = perf_df.loc[0, "Wins"]
+sim1_wins = perf_df.loc[0, "Win_Rate_%"]
 sim1_gain = perf_df.loc[0, "Total_Gain_%"] * 100
 ax.set_title(
-    f"MONTE CARLO SIMULATION #1 | {sim1_trades} TRADES — {sim1_wins} WON | "
-    f"GAIN: {sim1_gain:+.2f}%",
+    f"MONTE CARLO SIMULATION #1 WITH KELLY SIZING | {sim1_trades} TRADES — WIN"
+    f" RATE: {sim1_wins:.1f}% | GAIN: {sim1_gain:+.2f}%",
     color="white",
     fontsize=14,
     fontweight="bold",
@@ -270,7 +348,7 @@ for spine in ax.spines.values():
 plt.grid(visible=True, color="#1e293b", linestyle=":", alpha=0.5)
 plt.tight_layout()
 
-output_filename = "monte_carlo_pairs_simulation_chart.png"
+output_filename = "monte_carlo_kelly_simulation_chart.png"
 plt.savefig(output_filename, dpi=300, facecolor=fig.get_facecolor())
 print(f"Plot successfully saved as '{output_filename}'.")
 plt.show()
