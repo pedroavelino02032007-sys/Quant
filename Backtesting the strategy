@@ -1,354 +1,228 @@
+import argparse
 import datetime as dt
+import warnings
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
-from statsmodels.tsa.stattools import coint
-import yfinance as yf
+from statsmodels.tsa.stattools import adfuller, coint
 
-# ==========================================
-# 1. DATA LOADING & TRAIN/TEST SPLIT
-# ==========================================
-stocks = ["AMD", "INTC"]
-years = 5
-end = dt.datetime.now()
-start = end - dt.timedelta(days=365 * years)
+# ------------------------------------------------------------------ config
+TICKERS = ("AMD", "INTC")
+YEARS = 5
+TRAIN_FRAC = 0.625
+WINDOW = 30             # rolling z-score window (days)
+ENTRY_Z = 2.0
+EXIT_Z = 0.0
+STOP_Z = 3.5
+MAX_HOLD = 20           # time stop (days)
+MAX_TRADE_LOSS = 0.03   # hard stop in REAL P&L: close if a trade loses 3% of equity
+LEVERAGE = 1.0          # gross exposure (both legs) as a multiple of equity
+COST_BPS = 5.0          # per side, per unit of gross notional (commission + slippage)
+START_CAPITAL = 10_000.0
+SEED = None             # Set to None for random simulations every run (or an integer for reproducibility)
+OUT_PNG = "pairs_backtest.png"
 
-print("Downloading historical data for AMD and INTC...")
-close = yf.download(stocks, start=start, end=end, auto_adjust=True)["Close"]
-if isinstance(close, pd.DataFrame):
-  close = close.dropna()
-else:
-  close = close.to_frame().dropna()
 
-train_size = int(len(close) * 0.625)
-train_df = close.iloc[:train_size]
-test_df = close.iloc[train_size:].copy()
+# ------------------------------------------------------------------ data
+def make_synthetic(kind, seed, n=1260):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n)
+    log_i = np.log(30) + np.cumsum(rng.normal(0.0002, 0.02, n))
+    if kind == "coint":
+        phi, e = 0.955, np.zeros(n)  # half-life about 15 days
+        for t in range(1, n):
+            e[t] = phi * e[t - 1] + rng.normal(0, 0.012)
+        log_a = np.log(40) + 1.1 * (log_i - log_i[0]) + e
+    else:
+        log_a = np.log(40) + np.cumsum(rng.normal(0.0004, 0.025, n))
+    return pd.DataFrame({TICKERS[0]: np.exp(log_a), TICKERS[1]: np.exp(log_i)}, index=idx)
 
-# ==========================================
-# 2. COINTEGRATION & OLS HEDGE RATIO
-# ==========================================
-score, p_value, crit_value = coint(train_df["AMD"], train_df["INTC"])
-print(f"\n--- Cointegration Test ---")
-print(f"Cointegration P-Value: {p_value:.4f}")
-if p_value < 0.05:
-  print("Status: Pair is cointegrated! Safe to trade.")
-else:
-  print("Status: Warning: Pair is NOT cointegrated.")
 
-X = sm.add_constant(train_df["INTC"])
-model = sm.OLS(train_df["AMD"], X).fit()
-alpha = model.params["const"]
-beta = model.params["INTC"]
-print(f"\n--- OLS Regression ---")
-print(f"Hedge Ratio (Beta): {beta:.4f}, Alpha: {alpha:.4f}")
+def load_prices(synthetic=None):
+    if synthetic:
+        return make_synthetic(synthetic, SEED)
+    import yfinance as yf
 
-# ==========================================
-# 3. EXTRACT TRAIN SPREAD PARAMETERS
-# ==========================================
-train_spread = train_df["AMD"] - (beta * train_df["INTC"])
-spread_mean = train_spread.mean()
-spread_std = train_spread.std()
+    end = dt.date.today()
+    start = end - dt.timedelta(days=int(365.25 * YEARS))
 
-# ==========================================
-# 4. MONTE CARLO SIMULATIONS (30 Paths)
-# ==========================================
-num_simulations = 30
-sim_steps = len(test_df)
-starting_capital = 10000.0
+    px = yf.download(list(TICKERS), start=start, end=end, auto_adjust=True, progress=False)["Close"]
+    return px[list(TICKERS)].dropna()
 
-print(
-    f"\nRunning {num_simulations} stochastic Monte Carlo simulations over"
-    f" {sim_steps} trading days..."
-)
-simulation_results = np.zeros((sim_steps, num_simulations))
 
-for sim in range(num_simulations):
-  sim_shocks = np.random.normal(0, spread_std, sim_steps)
-  sim_spread = np.zeros(sim_steps)
-  sim_spread[0] = train_spread.iloc[-1]
+# ------------------------------------------------------------------ stats helpers
+def fit_hedge(log_px):
+    a, b = log_px[TICKERS[0]], log_px[TICKERS[1]]
+    p = sm.OLS(a, sm.add_constant(b)).fit().params
+    return p.iloc[0], p.iloc[1]  # alpha, beta
 
-  for t in range(1, sim_steps):
-    sim_spread[t] = (
-        sim_spread[t - 1]
-        + 0.1 * (spread_mean - sim_spread[t - 1])
-        + sim_shocks[t]
-    )
 
-  simulation_results[:, sim] = sim_spread
+def adf_pvalue(s):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)  # statsmodels changes adfuller's return type in 0.16
+        return adfuller(s)[1]
 
-# ==========================================
-# 5. BACKTEST STRATEGY & PRE-TRADE KELLY SIZING
-# ==========================================
-window = 30
-max_holding_days = 20
-performance_logs = []
-sample_trade_records = []
-sample_z_series = None
 
-for sim in range(num_simulations):
-  s_series = pd.Series(simulation_results[:, sim])
-  r_mean = s_series.rolling(window=window).mean()
-  r_std = s_series.rolling(window=window).std()
-  z_score = (s_series - r_mean) / r_std
+def half_life(spread):
+    s = spread.dropna()
+    d, lag = s.diff().iloc[1:], s.shift(1).iloc[1:]
+    k = sm.OLS(d, sm.add_constant(lag)).fit().params.iloc[1]
+    return -np.log(2) / np.log(1 + k) if -1 < k < 0 else np.inf
 
-  position = 0  # 0: Flat, 1: Long Spread, -1: Short Spread
-  trades = 0
-  wins = 0
-  portfolio_value = starting_capital
-  days_in_trade = 0
-  trade_returns = []
-  trade_records = []
 
-  entry_idx = None
-  entry_z = 0
+def metrics(ret):
+    eq = (1 + ret).cumprod()
+    sd = ret.std()
+    return {
+        "total_return": eq.iloc[-1] - 1,
+        "cagr": eq.iloc[-1] ** (252 / len(ret)) - 1,
+        "sharpe": ret.mean() / sd * np.sqrt(252) if sd > 0 else np.nan,
+        "max_drawdown": (eq / eq.cummax() - 1).min(),
+        "pct_days_in_market": None,
+    }
 
-  for i in range(window, len(s_series)):
-    z = z_score.iloc[i]
-    if pd.isna(z):
-      continue
 
-    if position != 0:
-      days_in_trade += 1
+# ------------------------------------------------------------------ strategy
+def generate_positions(z, spread_ret, scale):
+    """State machine. pos[t] = position decided at the close of day t (+1 long spread, -1 short)."""
+    pos_arr = np.zeros(len(z))
+    trades, pos, entry_i, trade_ret = [], 0, 0, 0.0
+    round_trip = 2 * LEVERAGE * COST_BPS / 1e4
 
-    if position == 0:
-      if z < -2.0:
-        position = 1
-        entry_idx = i
-        entry_z = z
-        days_in_trade = 0
-      elif z > 2.0:
-        position = -1
-        entry_idx = i
-        entry_z = z
-        days_in_trade = 0
+    def close_trade(t, reason):
+        trades.append({
+            "start": z.index[entry_i], "end": z.index[t], "side": "long" if pos == 1 else "short",
+            "days": t - entry_i, "gross_ret": trade_ret, "net_ret": trade_ret - round_trip,
+            "exit_reason": reason,
+        })
 
-    elif position == 1:
-      if z >= 0.0 or z < -3.5 or days_in_trade >= max_holding_days:
-        exit_idx = i
-        exit_z = z
-        trade_pnl = exit_z - entry_z
-        pnl_pct = (trade_pnl / abs(entry_z)) if entry_z != 0 else 0.0
+    for t in range(len(z)):
+        zt = z.iloc[t]
+        if np.isnan(zt):
+            continue
+        if pos != 0:
+            trade_ret += pos * scale * spread_ret.iloc[t]  # return earned by yesterday's decision
+            held, reason = t - entry_i, None
+            if (pos == 1 and zt >= EXIT_Z) or (pos == -1 and zt <= -EXIT_Z):
+                reason = "revert"
+            elif abs(zt) > STOP_Z:
+                reason = "z_stop"
+            elif trade_ret < -MAX_TRADE_LOSS:
+                reason = "loss_stop"
+            elif held >= MAX_HOLD:
+                reason = "time_stop"
+            if reason:
+                close_trade(t, reason)
+                pos = 0
+        elif -STOP_Z < zt < -ENTRY_Z:
+            pos, entry_i, trade_ret = 1, t, 0.0
+        elif ENTRY_Z < zt < STOP_Z:
+            pos, entry_i, trade_ret = -1, t, 0.0
+        pos_arr[t] = pos
+    if pos != 0:
+        close_trade(len(z) - 1, "open")
+    return pd.Series(pos_arr, index=z.index), pd.DataFrame(trades)
 
-        risk = abs(entry_z - (-3.5))
-        reward = abs(exit_z - entry_z)
-        rr_ratio = reward / risk if risk > 0 else 0.0
 
-        # --- Pre-Trade Kelly Criterion Estimation ---
-        # Using historical win rate & payout ratio prior to this trade, 
-        # or defaults (50% win rate, 1.0 payoff ratio) if no prior trades yet.
-        if trades > 0 and len(trade_returns) > 0:
-          current_wins = sum(1 for r in trade_returns if r > 0)
-          est_win_rate = current_wins / trades
-          wins_list = [r for r in trade_returns if r > 0]
-          losses_list = [abs(r) for r in trade_returns if r < 0]
-          avg_win = np.mean(wins_list) if len(wins_list) > 0 else 0.0
-          avg_loss = np.mean(losses_list) if len(losses_list) > 0 else 0.0001
-          b_ratio = (avg_win / avg_loss) if avg_loss > 0 else 1.0
-          kelly_f = max(
-              0.0,
-              min(
-                  ((est_win_rate * (b_ratio + 1) - 1) / b_ratio)
-                  if b_ratio > 0
-                  else 0.1,
-                  1.0,
-              ),
-          )
-        else:
-          kelly_f = 0.15  # Default conservative initial allocation before first trade
+# ------------------------------------------------------------------ plotting
+def plot(z, trades, equity, path):
+    fig, axes = plt.subplots(2, 1, figsize=(14, 9), facecolor="black",
+                             gridspec_kw={"height_ratios": [3, 2]})
+    for ax in axes:
+        ax.set_facecolor("black")
+        ax.tick_params(colors="#94a3b8")
+        ax.grid(color="#1e293b", linestyle=":", alpha=0.5)
+        for s in ax.spines.values():
+            s.set_color("#1e293b")
 
-        # Use Half-Kelly fractional sizing to position-size the dollar risk
-        position_capital = portfolio_value * (kelly_f * 0.5)
-        portfolio_value += trade_pnl * (position_capital / 100.0)
+    ax = axes[0]
+    ax.plot(z.index, z, color="#38bdf8", lw=1.3)
+    for lvl, c in ((ENTRY_Z, "#ef4444"), (-ENTRY_Z, "#10b981"), (0, "#64748b")):
+        ax.axhline(lvl, color=c, ls="--", lw=1, alpha=0.8)
+    for _, tr in trades.iterrows():
+        ax.axvspan(tr["start"], tr["end"], color="#10b981" if tr["net_ret"] > 0 else "#ef4444", alpha=0.25)
+    ax.set_title("AMD & INTC Stat arbitrage Backtest strategy",
+                 color="white", fontweight="bold")
 
-        trades += 1
-        if trade_pnl > 0:
-          wins += 1
-        trade_returns.append(pnl_pct)
+    axes[1].plot(equity.index, equity, color="#f59e0b", lw=1.6)
+    axes[1].axhline(START_CAPITAL, color="#64748b", ls="--", lw=1)
+    axes[1].set_title("Portfolio Value ($)", color="white", fontweight="bold")
 
-        if sim == 0:
-          trade_records.append({
-              "start": entry_idx,
-              "end": exit_idx,
-              "entry_z": entry_z,
-              "pnl_pct": pnl_pct * 100,
-              "rr": rr_ratio,
-              "win": trade_pnl > 0,
-          })
+    plt.tight_layout()
+    plt.savefig(path, dpi=200, facecolor=fig.get_facecolor())
 
-        position = 0
-        days_in_trade = 0
 
-    elif position == -1:
-      if z <= 0.0 or z > 3.5 or days_in_trade >= max_holding_days:
-        exit_idx = i
-        exit_z = z
-        trade_pnl = entry_z - exit_z
-        pnl_pct = (trade_pnl / abs(entry_z)) if entry_z != 0 else 0.0
+# ------------------------------------------------------------------ main
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--synthetic", choices=["coint", "null"])
+    ap.add_argument("--no-show", action="store_true")
+    args = ap.parse_args()
 
-        risk = abs(entry_z - 3.5)
-        reward = abs(entry_z - exit_z)
-        rr_ratio = reward / risk if risk > 0 else 0.0
+    A, I = TICKERS
+    px = load_prices(args.synthetic)
+    logp = np.log(px)
+    split = int(len(logp) * TRAIN_FRAC)
+    train, test = logp.iloc[:split], logp.iloc[split:]
+    print(f"Data: {px.index[0].date()} to {px.index[-1].date()} | train {len(train)}d | test {len(test)}d")
 
-        if trades > 0 and len(trade_returns) > 0:
-          current_wins = sum(1 for r in trade_returns if r > 0)
-          est_win_rate = current_wins / trades
-          wins_list = [r for r in trade_returns if r > 0]
-          losses_list = [abs(r) for r in trade_returns if r < 0]
-          avg_win = np.mean(wins_list) if len(wins_list) > 0 else 0.0
-          avg_loss = np.mean(losses_list) if len(losses_list) > 0 else 0.0001
-          b_ratio = (avg_win / avg_loss) if avg_loss > 0 else 1.0
-          kelly_f = max(
-              0.0,
-              min(
-                  ((est_win_rate * (b_ratio + 1) - 1) / b_ratio)
-                  if b_ratio > 0
-                  else 0.1,
-                  1.0,
-              ),
-          )
-        else:
-          kelly_f = 0.15
+    # ---- everything below is estimated on TRAIN only
+    p_train = coint(train[A], train[I])[1]
+    alpha, beta = fit_hedge(train)
+    if beta <= 0:
+        raise SystemExit(f"Hedge ratio is {beta:.3f}. Negative beta means this isn't a long/short pair.")
+    spread = logp[A] - beta * logp[I]
+    hl_train = half_life(spread.iloc[:split])
 
-        position_capital = portfolio_value * (kelly_f * 0.5)
-        portfolio_value += trade_pnl * (position_capital / 100.0)
+    # ---- out-of-sample health check: did the relationship survive?
+    p_adf_test = adf_pvalue(spread.iloc[split:])
+    _, beta_test = fit_hedge(test)
+    hl_test = half_life(spread.iloc[split:])
 
-        trades += 1
-        if trade_pnl > 0:
-          wins += 1
-        trade_returns.append(pnl_pct)
+    print("\n--- Relationship diagnostics (log prices) ---")
+    print(f"Train cointegration p-value : {p_train:.4f}")
+    print(f"Train hedge ratio (beta)    : {beta:.3f}   | refit on test: {beta_test:.3f}")
+    print(f"Half-life train / test      : {hl_train:.1f} / {hl_test:.1f} days")
+    print(f"ADF p-value, spread on TEST : {p_adf_test:.4f}   <-- the one that matters")
 
-        if sim == 0:
-          trade_records.append({
-              "start": entry_idx,
-              "end": exit_idx,
-              "entry_z": entry_z,
-              "pnl_pct": pnl_pct * 100,
-              "rr": rr_ratio,
-              "win": trade_pnl > 0,
-          })
+    # ---- backtest on real test prices
+    z = ((spread - spread.rolling(WINDOW).mean()) / spread.rolling(WINDOW).std()).iloc[split:]
+    spread_ret = spread.diff().iloc[split:]
+    scale = LEVERAGE / (1 + abs(beta))
+    pos, trades = generate_positions(z, spread_ret, scale)
 
-        position = 0
-        days_in_trade = 0
+    held = pos.shift(1).fillna(0.0)
+    turnover = pos.diff().abs().fillna(pos.abs())
+    strat_ret = held * scale * spread_ret - turnover * LEVERAGE * COST_BPS / 1e4
+    strat_ret = strat_ret.dropna()
+    equity = START_CAPITAL * (1 + strat_ret).cumprod()
 
-  total_gain_pct = (portfolio_value / starting_capital) - 1.0
-  win_rate = (wins / trades) if trades > 0 else 0.0
+    m = metrics(strat_ret)
+    m["pct_days_in_market"] = (held != 0).mean()
+    print("\n--- Backtest on REAL test prices (net of costs) ---")
+    print(f"Total return : {m['total_return']:+.2%}   CAGR: {m['cagr']:+.2%}")
+    print(f"Sharpe       : {m['sharpe']:.2f}")
+    print(f"Max drawdown : {m['max_drawdown']:.2%}")
+    print(f"Time in mkt  : {m['pct_days_in_market']:.0%}")
+    print(f"Final equity : ${equity.iloc[-1]:,.2f} (start ${START_CAPITAL:,.0f})")
 
-  performance_logs.append({
-      "Simulation": sim + 1,
-      "Total_Trades": trades,
-      "Win_Rate_%": win_rate * 100,
-      "Final_Portfolio_Value": portfolio_value,
-      "Total_Gain_%": total_gain_pct,
-  })
+    if len(trades):
+        w = trades["net_ret"] > 0
+        print(f"\nTrades: {len(trades)} | win rate {w.mean():.0%} | "
+              f"avg win {trades.loc[w, 'net_ret'].mean():+.2%} | "
+              f"avg loss {trades.loc[~w, 'net_ret'].mean():+.2%}")
+        print("Exit reasons:", trades["exit_reason"].value_counts().to_dict())
+    else:
+        print("\nNo trades triggered.")
 
-  if sim == 0:
-    sample_trade_records = trade_records
-    sample_z_series = z_score
+    plot(z, trades if len(trades) else pd.DataFrame(columns=["start", "end", "net_ret"]),
+         equity, OUT_PNG)
+    print(f"\nChart saved to {OUT_PNG}")
+    if not args.no_show:
+        plt.show()
 
-perf_df = pd.DataFrame(performance_logs)
 
-# ==========================================
-# 6. TERMINAL SUMMARY DISPLAY
-# ==========================================
-display_df = perf_df.head(10).copy()
-display_df["Win_Rate_%"] = display_df["Win_Rate_%"].apply(lambda x: f"{x:.1f}%")
-display_df["Final_Portfolio_Value"] = display_df["Final_Portfolio_Value"].apply(
-    lambda x: f"${x:,.2f}"
-)
-display_df["Total_Gain_%"] = display_df["Total_Gain_%"].apply(
-    lambda x: f"{x * 100:.2f}%"
-)
-
-print(
-    "\n--- Monte Carlo Backtest Summary with Pre-Trade Kelly Sizing (First 10"
-    " Simulations) ---"
-)
-print(display_df.to_string(index=False))
-
-print(
-    f"\nAverage Final Portfolio Value: "
-    f"${perf_df['Final_Portfolio_Value'].mean():,.2f}"
-)
-print(f"Average Total Gain: {perf_df['Total_Gain_%'].mean() * 100:.2f}%")
-
-# ==========================================
-# 7. MATPLOTLIB VISUALIZATION (Simulation #1)
-# ==========================================
-fig, ax = plt.subplots(figsize=(14, 7), facecolor="#0b0f19")
-ax.set_facecolor("#0b0f19")
-
-ax.plot(
-    sample_z_series.index,
-    sample_z_series,
-    color="#38bdf8",
-    linewidth=1.8,
-    label="Simulated Z-Score (Path #1)",
-    zorder=3,
-)
-ax.axhline(0, color="#64748b", linestyle="--", alpha=0.6, linewidth=1)
-ax.axhline(2.0, color="#ef4444", linestyle="-", alpha=0.9, linewidth=1.2)
-ax.axhline(-2.0, color="#10b981", linestyle="-", alpha=0.9, linewidth=1.2)
-
-ax.axhspan(2.0, sample_z_series.max() + 1.0, color="#ef4444", alpha=0.12)
-ax.axhspan(-2.0, sample_z_series.min() - 1.0, color="#10b981", alpha=0.12)
-
-for tr in sample_trade_records:
-  start, end = tr["start"], tr["end"]
-  pnl = tr["pnl_pct"]
-  rr = tr["rr"]
-  is_win = tr["win"]
-
-  span_color = "#10b981" if is_win else "#ef4444"
-  ax.axvspan(start, end, color=span_color, alpha=0.22, zorder=2)
-  ax.scatter([start], [tr["entry_z"]], color="#f59e0b", s=65, zorder=5)
-
-  mid_x = start + (end - start) / 2
-  window_slice = sample_z_series.loc[start:end]
-  label_y = (
-      window_slice.max() + 0.4
-      if not window_slice.empty
-      else tr["entry_z"] + 0.4
-  )
-
-  text_str = f"PnL: {pnl:+.1f}%\nRR: {rr:.1f}"
-  ax.text(
-      mid_x,
-      label_y,
-      text_str,
-      color="white",
-      fontsize=8,
-      fontweight="bold",
-      ha="center",
-      va="bottom",
-      bbox=dict(
-          boxstyle="round,pad=0.2",
-          facecolor="#1e293b",
-          edgecolor=span_color,
-          alpha=0.85,
-      ),
-  )
-
-sim1_trades = perf_df.loc[0, "Total_Trades"]
-sim1_wins = perf_df.loc[0, "Win_Rate_%"]
-sim1_gain = perf_df.loc[0, "Total_Gain_%"] * 100
-ax.set_title(
-    f"MONTE CARLO SIMULATION #1 WITH KELLY SIZING | {sim1_trades} TRADES — WIN"
-    f" RATE: {sim1_wins:.1f}% | GAIN: {sim1_gain:+.2f}%",
-    color="white",
-    fontsize=14,
-    fontweight="bold",
-    pad=25,
-)
-
-ax.tick_params(colors="#94a3b8", labelsize=11)
-for spine in ax.spines.values():
-  spine.set_color("#1e293b")
-
-plt.grid(visible=True, color="#1e293b", linestyle=":", alpha=0.5)
-plt.tight_layout()
-
-output_filename = "monte_carlo_kelly_simulation_chart.png"
-plt.savefig(output_filename, dpi=300, facecolor=fig.get_facecolor())
-print(f"Plot successfully saved as '{output_filename}'.")
-plt.show()
+if __name__ == "__main__":
+    main()
