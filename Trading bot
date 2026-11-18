@@ -1,0 +1,113 @@
+import asyncio
+# Required in Python 3.14 before importing ib_insync
+asyncio.set_event_loop(asyncio.new_event_loop())
+
+import pandas as pd
+from ib_insync import IB, Stock, MarketOrder, util
+
+# Initialize IB instance
+ib = IB()
+
+# Define callbacks for error handling and order status tracking
+def onError(reqId, errorCode, errorString, contract=None):
+    print(f"[Error] Request ID: {reqId}, Error Code: {errorCode}, Message: {errorString}")
+
+def onOrderStatus(trade):
+    print(f"[Order Status] Order {trade.order.orderId} is {trade.orderStatus.status}")
+
+ib.errorEvent += onError
+ib.orderStatusEvent += onOrderStatus
+
+# 1. Connect to local TWS and verify server time
+try:
+    ib.connect('127.0.0.1', 7497, clientId=1)
+    print("[Success] Successfully connected to TWS!")
+    server_time = ib.reqCurrentTime()
+    print(f"[Success] Current server time: {server_time}")
+except Exception as e:
+    print(f"[Error] Failed to connect or retrieve server time: {e}")
+    raise SystemExit()
+
+# 2. Define and qualify SPY contract
+spy_contract = Stock('SPY', 'SMART', 'USD')
+ib.qualifyContracts(spy_contract)
+
+# 3. Enter a Test Buy Order
+print("\n[Info] Placing the market order for 1 share of SPY...")
+buy_trade = ib.placeOrder(spy_contract, MarketOrder('BUY', 1))
+
+print("[Info] Waiting for the buy order to be processed...")
+while not buy_trade.isDone():
+    ib.waitOnUpdate(timeout=5)
+
+print(f"[Order Status] The buy order status is: {buy_trade.orderStatus.status}")
+
+open_orders = ib.openOrders()
+if buy_trade.order in open_orders:
+    print("[Check] Buy order is still in the open orders list.")
+else:
+    print("[Check] Buy order is no longer in the open orders list (likely filled or canceled).")
+
+ib.sleep(1)  # Allow portfolio state to sync
+portfolio = ib.portfolio()
+spy_position = next((p for p in portfolio if p.contract.symbol == 'SPY'), None)
+if spy_position and spy_position.position != 0:
+    print(f"[Success] Portfolio updated. Current SPY position: {spy_position.position} shares")
+else:
+    print("[Check] SPY position not found in portfolio (order may not be filled yet).")
+
+# 4. Enter a Test Sell Order
+print("\n[Info] Placing the market order to sell 1 share of SPY...")
+sell_trade = ib.placeOrder(spy_contract, MarketOrder('SELL', 1))
+
+print("[Info] Waiting for the sell order to be processed...")
+while not sell_trade.isDone():
+    ib.waitOnUpdate(timeout=5)
+
+print(f"[Order Status] The sell order status is: {sell_trade.orderStatus.status}")
+
+sell_open_orders = ib.openOrders()
+if sell_trade.order in sell_open_orders:
+    print("[Check] Sell order is still in the open orders list.")
+else:
+    print("[Check] Sell order is no longer in the open orders list (likely filled or canceled).")
+
+ib.sleep(1)  # Allow portfolio state to sync
+portfolio_after_sell = ib.portfolio()
+spy_position_after_sell = next((p for p in portfolio_after_sell if p.contract.symbol == 'SPY'), None)
+if spy_position_after_sell and spy_position_after_sell.position != 0:
+    print(f"[Check] SPY position is still present in portfolio. Current position: {spy_position_after_sell.position} shares.")
+else:
+    print("[Success] SPY position has been closed in the portfolio (0 shares).")
+
+# 5. Retrieve Historical Stock Prices From Interactive Brokers
+if not ib.isConnected():
+    print("\n[Error] Not connected to TWS. Please reconnect before requesting data.")
+else:
+    try:
+        # Switch to delayed data mode if live data subscription is not active
+        ib.reqMarketDataType(3)
+
+        print("\n[Info] Requesting historical price data for SPY...")
+        historical_data = ib.reqHistoricalData(
+            spy_contract,
+            endDateTime='',
+            durationStr='300 D',
+            barSizeSetting='1 day',
+            whatToShow='TRADES',
+            useRTH=True
+        )
+
+        # Convert to a Pandas DataFrame
+        df = util.df(historical_data)
+
+        if df is not None and not df.empty:
+            print("[Success] Historical price data retrieved successfully.")
+            print(df.head())
+        else:
+            print("[Error] No historical data returned for SPY.")
+    except Exception as e:
+        print(f"[Error] An error occurred while requesting historical data: {e}")
+
+# Disconnect cleanly when finished
+ib.disconnect()
