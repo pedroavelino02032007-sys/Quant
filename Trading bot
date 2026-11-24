@@ -1,113 +1,546 @@
 import asyncio
-# Required in Python 3.14 before importing ib_insync
-asyncio.set_event_loop(asyncio.new_event_loop())
+import nest_asyncio
 
-import pandas as pd
-from ib_insync import IB, Stock, MarketOrder, util
-
-# Initialize IB instance
-ib = IB()
-
-# Define callbacks for error handling and order status tracking
-def onError(reqId, errorCode, errorString, contract=None):
-    print(f"[Error] Request ID: {reqId}, Error Code: {errorCode}, Message: {errorString}")
-
-def onOrderStatus(trade):
-    print(f"[Order Status] Order {trade.order.orderId} is {trade.orderStatus.status}")
-
-ib.errorEvent += onError
-ib.orderStatusEvent += onOrderStatus
-
-# 1. Connect to local TWS and verify server time
+# Safely initialize or patch the event loop for Python 3.10–3.14 and Jupyter/Colab
 try:
-    ib.connect('127.0.0.1', 7497, clientId=1)
-    print("[Success] Successfully connected to TWS!")
-    server_time = ib.reqCurrentTime()
-    print(f"[Success] Current server time: {server_time}")
-except Exception as e:
-    print(f"[Error] Failed to connect or retrieve server time: {e}")
-    raise SystemExit()
-
-# 2. Define and qualify SPY contract
-spy_contract = Stock('SPY', 'SMART', 'USD')
-ib.qualifyContracts(spy_contract)
-
-# 3. Enter a Test Buy Order
-print("\n[Info] Placing the market order for 1 share of SPY...")
-buy_trade = ib.placeOrder(spy_contract, MarketOrder('BUY', 1))
-
-print("[Info] Waiting for the buy order to be processed...")
-while not buy_trade.isDone():
-    ib.waitOnUpdate(timeout=5)
-
-print(f"[Order Status] The buy order status is: {buy_trade.orderStatus.status}")
-
-open_orders = ib.openOrders()
-if buy_trade.order in open_orders:
-    print("[Check] Buy order is still in the open orders list.")
-else:
-    print("[Check] Buy order is no longer in the open orders list (likely filled or canceled).")
-
-ib.sleep(1)  # Allow portfolio state to sync
-portfolio = ib.portfolio()
-spy_position = next((p for p in portfolio if p.contract.symbol == 'SPY'), None)
-if spy_position and spy_position.position != 0:
-    print(f"[Success] Portfolio updated. Current SPY position: {spy_position.position} shares")
-else:
-    print("[Check] SPY position not found in portfolio (order may not be filled yet).")
-
-# 4. Enter a Test Sell Order
-print("\n[Info] Placing the market order to sell 1 share of SPY...")
-sell_trade = ib.placeOrder(spy_contract, MarketOrder('SELL', 1))
-
-print("[Info] Waiting for the sell order to be processed...")
-while not sell_trade.isDone():
-    ib.waitOnUpdate(timeout=5)
-
-print(f"[Order Status] The sell order status is: {sell_trade.orderStatus.status}")
-
-sell_open_orders = ib.openOrders()
-if sell_trade.order in sell_open_orders:
-    print("[Check] Sell order is still in the open orders list.")
-else:
-    print("[Check] Sell order is no longer in the open orders list (likely filled or canceled).")
-
-ib.sleep(1)  # Allow portfolio state to sync
-portfolio_after_sell = ib.portfolio()
-spy_position_after_sell = next((p for p in portfolio_after_sell if p.contract.symbol == 'SPY'), None)
-if spy_position_after_sell and spy_position_after_sell.position != 0:
-    print(f"[Check] SPY position is still present in portfolio. Current position: {spy_position_after_sell.position} shares.")
-else:
-    print("[Success] SPY position has been closed in the portfolio (0 shares).")
-
-# 5. Retrieve Historical Stock Prices From Interactive Brokers
-if not ib.isConnected():
-    print("\n[Error] Not connected to TWS. Please reconnect before requesting data.")
-else:
+    nest_asyncio.apply(asyncio.get_running_loop())
+except RuntimeError:
     try:
-        # Switch to delayed data mode if live data subscription is not active
-        ib.reqMarketDataType(3)
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
-        print("\n[Info] Requesting historical price data for SPY...")
-        historical_data = ib.reqHistoricalData(
-            spy_contract,
-            endDateTime='',
-            durationStr='300 D',
-            barSizeSetting='1 day',
-            whatToShow='TRADES',
-            useRTH=True
+import json
+import logging
+import os
+import threading
+import time
+from dataclasses import dataclass
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import websocket
+from ib_insync import IB, MarketOrder, Stock
+
+try:
+    from IPython import get_ipython
+    from IPython.display import clear_output
+
+    IN_NOTEBOOK = get_ipython() is not None
+except ImportError:
+    IN_NOTEBOOK = False
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Config:
+    # Finnhub WebSocket settings
+    finnhub_api_key: str = os.getenv("FINNHUB_API_KEY", "PUT_FINNHUB_KEY_HERE")
+    stream_symbol: str = "SPY"          # Tip: use "BINANCE:BTCUSDT" to test 24/7 after hours
+
+    # Interactive Brokers TWS settings
+    ib_host: str = "127.0.0.1"          # Local TWS (use "serveo.net" only if tunneling)
+    ib_port: int = 7497                 # 7497 = TWS Paper, 7496 = TWS Live
+    ib_client_id: int = 2
+    ib_connect_timeout: int = 15
+    ib_symbol: str = "SPY"
+    ib_exchange: str = "SMART"
+    ib_currency: str = "USD"
+
+    # Strategy & risk settings
+    short_window: int = 20              # 20-tick SMA
+    long_window: int = 50               # 50-tick SMA
+    max_ticks: int = 300                # Rolling in-memory tick buffer size
+    execute_trades: bool = False        # Set True to send Paper/Live orders to TWS
+    position_size: int = 1              # Shares per order
+    max_positions: int = 10             # Max total shares = max_positions * position_size
+    cooldown_seconds: int = 10          # Minimum wait between orders
+    order_wait_seconds: int = 10
+
+    # Visualization & runtime settings
+    viz_interval_seconds: int = 5
+    reconnect_delay_seconds: int = 5
+
+
+CFG = Config()
+IB_INFO_CODES = {2104, 2106, 2158}
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logger = logging.getLogger("Finnhub_IBKR_Bot")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(_handler)
+
+# ---------------------------------------------------------------------------
+# Shared Thread-Safe State
+# ---------------------------------------------------------------------------
+TICK_COLUMNS = ["tick_id", "timestamp", "price", "size", "SMA_short", "SMA_long", "Signal"]
+
+_data_lock = threading.Lock()
+_stop_event = threading.Event()
+_tick_data = pd.DataFrame(columns=TICK_COLUMNS)
+_tick_counter = 0
+
+_ws_app: websocket.WebSocketApp | None = None
+_ws_thread: threading.Thread | None = None
+_trading_thread: threading.Thread | None = None
+
+
+def get_tick_snapshot() -> pd.DataFrame:
+    """Return a thread-safe copy of the rolling tick DataFrame."""
+    with _data_lock:
+        return _tick_data.copy()
+
+
+# ---------------------------------------------------------------------------
+# Signal Calculation
+# ---------------------------------------------------------------------------
+def calculate_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute short/long tick SMAs and mark crossover buy (1) / sell (-1) signals."""
+    df = df.copy()
+    df["Signal"] = 0
+
+    if len(df) < CFG.long_window:
+        df["SMA_short"] = pd.NA
+        df["SMA_long"] = pd.NA
+        return df
+
+    df["SMA_short"] = df["price"].rolling(window=CFG.short_window).mean()
+    df["SMA_long"] = df["price"].rolling(window=CFG.long_window).mean()
+
+    buy_cross = (df["SMA_short"] > df["SMA_long"]) & (
+        df["SMA_short"].shift(1) <= df["SMA_long"].shift(1)
+    )
+    sell_cross = (df["SMA_short"] < df["SMA_long"]) & (
+        df["SMA_short"].shift(1) >= df["SMA_long"].shift(1)
+    )
+
+    df.loc[buy_cross, "Signal"] = 1
+    df.loc[sell_cross, "Signal"] = -1
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Finnhub WebSocket Feed
+# ---------------------------------------------------------------------------
+def _on_ws_open(ws) -> None:
+    logger.info("Connected to Finnhub WebSocket. Subscribing to %s...", CFG.stream_symbol)
+    ws.send(json.dumps({"type": "subscribe", "symbol": CFG.stream_symbol}))
+
+
+def _on_ws_message(ws, message: str) -> None:
+    global _tick_data, _tick_counter
+    try:
+        payload = json.loads(message)
+        if payload.get("type") != "trade" or not payload.get("data"):
+            return
+
+        new_rows = []
+        with _data_lock:
+            for trade in payload["data"]:
+                _tick_counter += 1
+                new_rows.append(
+                    {
+                        "tick_id": _tick_counter,
+                        "timestamp": pd.Timestamp(trade["t"], unit="ms"),
+                        "price": float(trade["p"]),
+                        "size": float(trade["v"]),
+                    }
+                )
+
+            if not new_rows:
+                return
+
+            new_df = pd.DataFrame(new_rows)
+            if _tick_data.empty:
+                combined = new_df
+            else:
+                base_cols = ["tick_id", "timestamp", "price", "size"]
+                combined = pd.concat([_tick_data[base_cols], new_df], ignore_index=True)
+
+            if len(combined) > CFG.max_ticks:
+                combined = combined.tail(CFG.max_ticks).reset_index(drop=True)
+
+            _tick_data = calculate_signals(combined)
+            latest = _tick_data.iloc[-1]
+
+        if latest["Signal"] in (1, -1):
+            label = "BUY" if latest["Signal"] == 1 else "SELL"
+            logger.info(
+                "[SIGNAL] %s crossover detected at $%.2f (tick #%d)",
+                label,
+                latest["price"],
+                int(latest["tick_id"]),
+            )
+    except Exception as exc:
+        logger.error("Error processing WebSocket message: %s", exc)
+
+
+def _on_ws_error(ws, error) -> None:
+    logger.error("Finnhub WebSocket error: %s", error)
+
+
+def _on_ws_close(ws, close_status_code, close_msg) -> None:
+    logger.info("Finnhub WebSocket closed (code=%s, msg=%s).", close_status_code, close_msg)
+
+
+def _ws_loop() -> None:
+    """Maintain the Finnhub WebSocket connection with automatic reconnect."""
+    global _ws_app
+    if not CFG.finnhub_api_key or CFG.finnhub_api_key == "PUT_FINNHUB_KEY_HERE":
+        logger.error(
+            "Finnhub API key is not set. Set FINNHUB_API_KEY env var or update Config.finnhub_api_key."
+        )
+        return
+
+    ws_url = f"wss://ws.finnhub.io?token={CFG.finnhub_api_key}"
+
+    while not _stop_event.is_set():
+        _ws_app = websocket.WebSocketApp(
+            ws_url,
+            on_open=_on_ws_open,
+            on_message=_on_ws_message,
+            on_error=_on_ws_error,
+            on_close=_on_ws_close,
+        )
+        _ws_app.run_forever(ping_interval=20, ping_timeout=10)
+
+        if not _stop_event.is_set():
+            logger.info("Reconnecting to Finnhub in %ds...", CFG.reconnect_delay_seconds)
+            _stop_event.wait(CFG.reconnect_delay_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Interactive Brokers Helpers & Trading Listener Thread
+# ---------------------------------------------------------------------------
+def _attach_ib_callbacks(ib: IB) -> None:
+    def on_error(reqId, code, msg, contract=None):
+        if code in IB_INFO_CODES:
+            logger.info("IB info [code=%s]: %s", code, msg)
+        else:
+            logger.warning("IB message [reqId=%s, code=%s]: %s", reqId, code, msg)
+
+    def on_order_status(trade):
+        logger.info(
+            "[ORDER] ID=%s | Status=%s | Filled=%s | AvgFill=%.2f",
+            trade.order.orderId,
+            trade.orderStatus.status,
+            trade.orderStatus.filled,
+            trade.orderStatus.avgFillPrice,
         )
 
-        # Convert to a Pandas DataFrame
-        df = util.df(historical_data)
+    ib.errorEvent += on_error
+    ib.orderStatusEvent += on_order_status
 
-        if df is not None and not df.empty:
-            print("[Success] Historical price data retrieved successfully.")
-            print(df.head())
-        else:
-            print("[Error] No historical data returned for SPY.")
-    except Exception as e:
-        print(f"[Error] An error occurred while requesting historical data: {e}")
 
-# Disconnect cleanly when finished
-ib.disconnect()
+def _connect_ib(ib: IB) -> bool:
+    if ib.isConnected():
+        return True
+    try:
+        logger.info(
+            "Connecting to TWS at %s:%s (clientId=%s)...",
+            CFG.ib_host,
+            CFG.ib_port,
+            CFG.ib_client_id,
+        )
+        ib.connect(
+            CFG.ib_host,
+            CFG.ib_port,
+            clientId=CFG.ib_client_id,
+            timeout=CFG.ib_connect_timeout,
+        )
+        ib.reqMarketDataType(3)
+        logger.info("Connected to TWS! Server time: %s", ib.reqCurrentTime())
+        return True
+    except Exception as exc:
+        logger.error("TWS connection failed: %s", exc)
+        return False
+
+
+def _get_position(ib: IB, symbol: str) -> float:
+    return sum(pos.position for pos in ib.positions() if pos.contract.symbol == symbol)
+
+
+def _has_pending_order(ib: IB, symbol: str) -> bool:
+    open_trades = ib.reqAllOpenOrders()
+    return any(t.contract.symbol == symbol and not t.isDone() for t in open_trades)
+
+
+def _execute_ib_order(ib: IB, contract: Stock, signal_value: int) -> bool:
+    """Execute a BUY (1) or SELL (-1) market order with position & duplicate guards."""
+    if _has_pending_order(ib, contract.symbol):
+        logger.warning("Pending %s order exists. Skipping signal.", contract.symbol)
+        return False
+
+    current_pos = _get_position(ib, contract.symbol)
+    max_shares = CFG.max_positions * CFG.position_size
+
+    if signal_value == 1:
+        if current_pos >= max_shares:
+            logger.info("At max position (%s shares). Skipping BUY.", current_pos)
+            return False
+        action = "BUY"
+        qty = CFG.position_size
+    elif signal_value == -1:
+        if current_pos <= 0:
+            logger.info("No %s shares held. Skipping SELL.", contract.symbol)
+            return False
+        action = "SELL"
+        qty = min(CFG.position_size, current_pos)
+    else:
+        return False
+
+    trade = ib.placeOrder(contract, MarketOrder(action, qty, transmit=True))
+    logger.info("Submitted %s market order for %s %s (ID=%s).", action, qty, contract.symbol, trade.order.orderId)
+
+    for _ in range(CFG.order_wait_seconds):
+        ib.sleep(1)
+        if trade.isDone():
+            break
+
+    updated_pos = _get_position(ib, contract.symbol)
+    logger.info("Updated %s position: %s shares.", contract.symbol, updated_pos)
+    return True
+
+
+def _trading_listener_loop() -> None:
+    """Monitor tick_data for new crossover signals and route orders on a dedicated IBKR loop."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    nest_asyncio.apply(loop)
+
+    ib = IB()
+    _attach_ib_callbacks(ib)
+    contract: Stock | None = None
+
+    last_processed_tick_id = 0
+    last_trade_ts = 0.0
+    seconds_elapsed = 0
+
+    logger.info(
+        "Trading listener started | Auto-trading=%s | Symbol=%s",
+        "ENABLED" if CFG.execute_trades else "SIMULATION ONLY",
+        CFG.ib_symbol,
+    )
+
+    try:
+        while not _stop_event.is_set():
+            try:
+                # Keep IBKR connected only if live/paper execution is enabled
+                if CFG.execute_trades and not ib.isConnected():
+                    if _connect_ib(ib):
+                        candidate = Stock(CFG.ib_symbol, CFG.ib_exchange, CFG.ib_currency)
+                        qualified = ib.qualifyContracts(candidate)
+                        contract = qualified[0] if qualified else None
+                        if contract is None:
+                            logger.error("Failed to qualify contract %s.", CFG.ib_symbol)
+
+                df = get_tick_snapshot()
+                seconds_elapsed += 1
+
+                if seconds_elapsed % 30 == 0:
+                    if df.empty:
+                        logger.info("[STATUS] Waiting for Finnhub ticks for %s...", CFG.stream_symbol)
+                    else:
+                        latest = df.iloc[-1]
+                        logger.info(
+                            "[STATUS] Ticks=%d | Price=$%.2f | SMA%d=%s | SMA%d=%s",
+                            len(df),
+                            latest["price"],
+                            CFG.short_window,
+                            f"{latest['SMA_short']:.2f}" if pd.notna(latest["SMA_short"]) else "n/a",
+                            CFG.long_window,
+                            f"{latest['SMA_long']:.2f}" if pd.notna(latest["SMA_long"]) else "n/a",
+                        )
+
+                if len(df) >= CFG.long_window:
+                    new_signals = df[(df["Signal"] != 0) & (df["tick_id"] > last_processed_tick_id)]
+                    if not new_signals.empty:
+                        latest_sig = new_signals.iloc[-1]
+                        last_processed_tick_id = int(latest_sig["tick_id"])
+                        sig_val = int(latest_sig["Signal"])
+                        sig_price = float(latest_sig["price"])
+                        sig_label = "BUY" if sig_val == 1 else "SELL"
+
+                        now_ts = time.monotonic()
+                        if now_ts - last_trade_ts < CFG.cooldown_seconds:
+                            logger.info(
+                                "Signal %s at $%.2f skipped (cooldown %ds active).",
+                                sig_label,
+                                sig_price,
+                                CFG.cooldown_seconds,
+                            )
+                        elif CFG.execute_trades:
+                            if ib.isConnected() and contract is not None:
+                                if _execute_ib_order(ib, contract, sig_val):
+                                    last_trade_ts = time.monotonic()
+                            else:
+                                logger.warning("Signal %s missed: TWS not connected.", sig_label)
+                        else:
+                            logger.info(
+                                "[SIMULATION] Would %s %d share(s) of %s at $%.2f",
+                                sig_label,
+                                CFG.position_size,
+                                CFG.ib_symbol,
+                                sig_price,
+                            )
+                            last_trade_ts = time.monotonic()
+
+            except Exception as exc:
+                logger.exception("Error in trading listener: %s", exc)
+
+            # Keep ib_insync event loop alive while sleeping 1 second
+            if ib.isConnected():
+                ib.sleep(1)
+            else:
+                _stop_event.wait(1)
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+        logger.info("Trading listener stopped and disconnected.")
+        loop.close()
+
+
+# ---------------------------------------------------------------------------
+# Live Visualization (Main Thread)
+# ---------------------------------------------------------------------------
+def run_visualization(interval: int = CFG.viz_interval_seconds) -> None:
+    """Plot live tick price, SMAs, and crossover markers until interrupted."""
+    logger.info("Starting live visualization (refresh=%ds). Press Ctrl+C to stop.", interval)
+
+    if not IN_NOTEBOOK:
+        plt.ion()
+        fig, ax = plt.subplots(figsize=(14, 7))
+    else:
+        fig, ax = None, None
+
+    try:
+        while not _stop_event.is_set():
+            df = get_tick_snapshot()
+
+            if len(df) < CFG.long_window:
+                logger.info(
+                    "Collecting ticks (%d/%d needed for SMA%d)...",
+                    len(df),
+                    CFG.long_window,
+                    CFG.long_window,
+                )
+                _stop_event.wait(interval)
+                continue
+
+            if IN_NOTEBOOK:
+                clear_output(wait=True)
+                fig, ax = plt.subplots(figsize=(14, 7))
+            else:
+                ax.clear()
+
+            ax.plot(df["timestamp"], df["price"], label="Price", color="blue", alpha=0.7)
+            if not df["SMA_short"].isna().all():
+                ax.plot(
+                    df["timestamp"],
+                    df["SMA_short"],
+                    label=f"Short MA ({CFG.short_window} ticks)",
+                    linestyle="--",
+                    color="green",
+                )
+            if not df["SMA_long"].isna().all():
+                ax.plot(
+                    df["timestamp"],
+                    df["SMA_long"],
+                    label=f"Long MA ({CFG.long_window} ticks)",
+                    linestyle="--",
+                    color="red",
+                )
+
+            buys = df[df["Signal"] == 1]
+            sells = df[df["Signal"] == -1]
+            if not buys.empty:
+                ax.scatter(buys["timestamp"], buys["price"], label="Buy", marker="^", color="green", s=100, zorder=5)
+            if not sells.empty:
+                ax.scatter(sells["timestamp"], sells["price"], label="Sell", marker="v", color="red", s=100, zorder=5)
+
+            latest_price = df["price"].iloc[-1]
+            ax.set_title(
+                f"{CFG.stream_symbol} Real-Time Tick Signals | Latest: ${latest_price:.2f} "
+                f"| Ticks: {len(df)} | Buys: {len(buys)} | Sells: {len(sells)}"
+            )
+            ax.set_xlabel("Time (UTC)")
+            ax.set_ylabel("Price ($)")
+            ax.legend(loc="upper left")
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+
+            if IN_NOTEBOOK:
+                plt.show()
+                _stop_event.wait(interval)
+            else:
+                fig.canvas.draw()
+                plt.pause(interval)
+
+    except KeyboardInterrupt:
+        logger.info("Visualization interrupted by user.")
+    finally:
+        if not IN_NOTEBOOK:
+            plt.ioff()
+            plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle Controls
+# ---------------------------------------------------------------------------
+def start_system() -> None:
+    """Start both the Finnhub WebSocket thread and the IBKR trading listener thread."""
+    global _ws_thread, _trading_thread, _tick_data, _tick_counter
+
+    _stop_event.clear()
+    with _data_lock:
+        _tick_data = pd.DataFrame(columns=TICK_COLUMNS)
+        _tick_counter = 0
+
+    if not (_ws_thread and _ws_thread.is_alive()):
+        _ws_thread = threading.Thread(target=_ws_loop, daemon=True, name="Finnhub_WS_Thread")
+        _ws_thread.start()
+
+    if not (_trading_thread and _trading_thread.is_alive()):
+        _trading_thread = threading.Thread(
+            target=_trading_listener_loop, daemon=True, name="IBKR_Listener_Thread"
+        )
+        _trading_thread.start()
+
+    logger.info("Real-time Finnhub + IBKR trading system is running.")
+
+
+def stop_system() -> None:
+    """Cleanly stop the WebSocket stream and disconnect from IBKR."""
+    logger.info("Stopping system...")
+    _stop_event.set()
+
+    if _ws_app is not None:
+        try:
+            _ws_app.close()
+        except Exception:
+            pass
+
+    if _ws_thread and _ws_thread.is_alive():
+        _ws_thread.join(timeout=5)
+    if _trading_thread and _trading_thread.is_alive():
+        _trading_thread.join(timeout=10)
+
+    logger.info("System stopped cleanly.")
+
+
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    start_system()
+    try:
+        run_visualization()
+    finally:
+        stop_system()
