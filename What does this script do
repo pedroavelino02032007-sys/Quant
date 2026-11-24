@@ -1,0 +1,13 @@
+This project is an automated, real-time stock trading system built in Python that monitors live market activity, identifies trading opportunities, and executes orders automatically through Interactive Brokers. Engineered to run locally at zero cost, it replaces expensive market data subscriptions and cloud hosting by connecting a free live data feed (Finnhub) directly to a simulated brokerage account.
+
+At a high level, the system works like three coordinated specialists operating simultaneously:
+
+Live Market Listener: Maintains a continuous connection to live stock trades (such as SPY, which tracks the S&P 500) and retains a rolling history of the latest 300 transactions so the program stays fast and lightweight.
+
+Strategy & Execution Engine: Measures short-term momentum in real time by comparing the average price of the last 20 trades against the last 50 trades. When short-term momentum rises above the longer-term trend, it generates a buy signal; when it falls below, it generates a sell signal and submits the order to the broker.
+
+Live Visual Dashboard: Continuously updates a price chart displaying both trend lines along with buy and sell markers for immediate oversight.
+
+Beyond the trading strategy itself, the system incorporates practical risk controls and reliability safeguards. It defaults to a risk-free simulation mode, enforces maximum share limits, prevents duplicate orders, and applies cooldown timers to avoid excessive trading. It also automatically reconnects after network interruptions and safely coordinates shared data across background tasks.
+
+This project highlights practical capability in real-time data pipelines, financial API integration, automated decision-making, and risk-conscious system design.
